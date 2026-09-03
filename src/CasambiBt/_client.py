@@ -385,10 +385,12 @@ class CasambiClient:
         try:
             await self._gattClient.write_gatt_char(char, encPacket)
         except BleakError as e:
-            if e.args[0] == "Not connected":
+            if e.args and e.args[0] == "Not connected":
                 self._connectionState = ConnectionState.NONE
-            else:
-                raise e
+                raise ConnectionStateError(
+                    ConnectionState.AUTHENTICATED, ConnectionState.NONE
+                ) from e
+            raise BluetoothError from e
 
     def _getNonce(self, id: int | bytes) -> bytes:
         if isinstance(id, int):
