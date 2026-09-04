@@ -54,7 +54,7 @@ class Cache:
                     _LOGGER.error("Failed to parse cache version.", exc_info=True)
             if cacheVer is None:
                 cacheVer = 0
-            if cacheVer < CACHE_VERSION:
+            if cacheVer != CACHE_VERSION:
                 _LOGGER.warning(
                     "Cache is version %i, version %i is required. Recreating cache.",
                     cacheVer,
