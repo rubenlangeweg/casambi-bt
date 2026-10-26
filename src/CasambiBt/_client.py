@@ -257,7 +257,7 @@ class CasambiClient(ABC):
                     await self._callbackTask
             self._callbackTask = None
 
-        if self._gattClient is not None and self._gattClient.is_connected:
+        if self._gattClient is not None:
             try:
                 await self._gattClient.disconnect()
             except BleakError:

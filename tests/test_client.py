@@ -125,15 +125,16 @@ async def test_connect_bleak_error(mock_close, mock_establish, mock_get_device, 
         await client.connect()
 
 
-async def test_disconnect(client):
+@pytest.mark.parametrize("is_connected", [True, False])
+async def test_disconnect_cleans_up_existing_gatt_client(client, is_connected):
     client._connectionState = ConnectionState.CONNECTED
     client._gattClient = AsyncMock()
-    client._gattClient.is_connected = True
+    client._gattClient.is_connected = is_connected
     client._callbackTask = asyncio.create_task(asyncio.sleep(1))
 
     await client.disconnect()
 
-    client._gattClient.disconnect.assert_called_once()
+    client._gattClient.disconnect.assert_awaited_once()
     assert client._connectionState == ConnectionState.NONE
     assert client._callbackTask is None
 
