@@ -59,6 +59,12 @@ class BluetoothError(CasambiBtError):
     pass
 
 
+class BluetoothDeviceNotFoundError(CasambiBtError):
+    """Exception that is raised when the bluetooth device used by the network can't be found."""
+
+    pass
+
+
 class ProtocolError(CasambiBtError):
     """Exception that is raised when communication with the device doesn't follow the expected protocol."""
 

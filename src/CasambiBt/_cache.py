@@ -11,7 +11,7 @@ from anyio import Path
 _LOGGER = logging.getLogger(__name__)
 
 CACHE_PATH_DEFAULT: Final = Path(os.getcwd()) / "casambi-bt-store"
-CACHE_VERSION: Final = 2
+CACHE_VERSION: Final = 4
 
 # We need a global lock since there could be multiple Casambi instances
 # with their own cache instances pointing to the same folder.
@@ -54,7 +54,7 @@ class Cache:
                     _LOGGER.error("Failed to parse cache version.", exc_info=True)
             if cacheVer is None:
                 cacheVer = 0
-            if cacheVer < CACHE_VERSION:
+            if cacheVer != CACHE_VERSION:
                 _LOGGER.warning(
                     "Cache is version %i, version %i is required. Recreating cache.",
                     cacheVer,
@@ -72,10 +72,10 @@ class Cache:
     async def __aenter__(self) -> Path:
         await _cacheLock.acquire()
 
-        if self._uuid is None:
-            raise ValueError("UUID not set.")
-
         try:
+            if self._uuid is None:
+                raise ValueError("UUID not set.")
+
             await self._ensureCacheValid()
 
             cacheDir = Path(self._cachePath / self._uuid)

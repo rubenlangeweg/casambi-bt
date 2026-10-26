@@ -4,8 +4,8 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-bleak = ">=2.1.0"
-bleak-retry-connector = ">=3.6.0"
+bleak = ">=3.0.0"
+bleak-retry-connector = ">=4.6.0"
 cryptography = ">=40.0.0"
 httpx = ">=0.25"
 anyio = ">=4.12.0"
@@ -17,6 +17,9 @@ isort = "*"
 ruff = "*"
 build = "*"
 twine = "*"
+pytest = "*"
+pytest-asyncio = "*"
+pytest-cov = "*"
 
 [requires]
 python_version = "3.11"

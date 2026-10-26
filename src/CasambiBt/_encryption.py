@@ -1,6 +1,7 @@
 import logging
 from binascii import b2a_hex as b2a
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.algorithms import AES
 from cryptography.hazmat.primitives.ciphers.modes import CBC, ECB
@@ -27,7 +28,7 @@ class Encryptor:
         self._logger = logging.getLogger(__name__)
 
     def encryptThenMac(self, packet: bytes, nonce: bytes, headerLen: int = 4) -> bytes:
-        self._logger.info(
+        self._logger.debug(
             f"Encrypting packet: {b2a(packet)} of len {len(packet)} with nonce {b2a(nonce)}"
         )
         packet = bytes(packet)
@@ -37,14 +38,12 @@ class Encryptor:
         cmacCipher = CMAC(self._aes)
         cmacCipher.update(packet)
         packet += cmacCipher.finalize()
-        self._logger.debug(f"Authenticated packet: {b2a(packet)}")
-
         return packet
 
     def decryptAndVerify(
         self, packet: bytes, nonce: bytes, headerLen: int = 4
     ) -> bytes:
-        self._logger.info(
+        self._logger.debug(
             f"Decrypting packet: {b2a(packet)} of len {len(packet)} with nonce {b2a(nonce)}"
         )
         packet = bytes(packet)
@@ -76,37 +75,47 @@ class Encryptor:
 
         return result
 
-    # TODO: Replace with CMAC primitive
-    def cmac(self, data: bytes) -> bytes:
-        encZeros = _encHelper(self._blockCipher, bytes(16))
-        encZeros = self._randomTransform(encZeros)
 
-        # pad with zeros
-        pakLen = len(data)
-        if pakLen % 16 != 0:
-            data += b"\x80"
-            data += bytes((((pakLen // 16) + 1) * 16) - pakLen)[1:]
+class ClassicEncryptor:
+    def __init__(self, key: bytes, sig_len: int) -> None:
+        self._aes = AES(key)
+        self._cipher = Cipher(AES(key), mode=ECB())
+        self._sig_len = sig_len
+        self._logger = logging.getLogger(__name__)
 
-            encZeros = self._randomTransform(encZeros)
+    def digest(self, packet: bytes, connhash: bytes) -> bytes:
+        # We leave handling the auth level to the caller and expect the packet to start with the signature.
 
-        mac = bytes(16)
-        if len(data) > 16:
-            mac = _encHelper(self._cmacCipher, data[:-16])[-16:]
+        if len(connhash) != 8:
+            raise ValueError("Connhash must be 8 bytes long.")
 
-        lastInput = _xor(data[-16:], _xor(encZeros, mac))
-        result = _encHelper(self._blockCipher, lastInput)
-        self._logger.debug(f"CMAC is {b2a(result)}")
-        return result
+        cmacCipher = CMAC(self._aes)
+        cmacCipher.update(connhash + packet)
+        cmac = cmacCipher.finalize()
 
-    def _randomTransform(self, block: bytes) -> bytes:
-        highestBit = (block[0] & 128) != 0
-        block = self._shiftBlock(block)
-        if highestBit:
-            block = block[:-1] + bytes([block[-1] ^ 135])
-        return block
+        return cmac[: self._sig_len] + packet
 
-    def _shiftBlock(self, block: bytes) -> bytes:
-        assert len(block) == 16
+    def verify(self, packet: bytes, connhash: bytes) -> bytes:
+        # We leave handling the auth level to the caller and expect the packet to start with the signature.
 
-        blockInt = int.from_bytes(block, "big") << 1
-        return int.to_bytes(blockInt, 17, "big")[1:]
+        if len(connhash) != 8:
+            raise ValueError("Connhash must be 8 bytes long.")
+
+        cmacCipher = CMAC(self._aes)
+        cmacCipher.update(connhash + packet[self._sig_len :])
+        computedMac = cmacCipher.finalize()[: self._sig_len]
+        pckMac = packet[: self._sig_len]
+
+        # Time-constant comparison. Need to do this ourselves because the signature is not always 16 bytes long.
+        result = True
+        for i in range(self._sig_len):
+            if computedMac[i] != pckMac[i]:
+                result = False
+
+        if not result:
+            self._logger.warning(
+                f"Signature verification failed. Computed: {b2a(computedMac)}, packet: {b2a(pckMac)}"
+            )
+            raise InvalidSignature("Signature verification failed.")
+
+        return packet[self._sig_len :]

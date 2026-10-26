@@ -4,6 +4,8 @@ import pickle
 from dataclasses import dataclass
 from typing import Final
 
+from CasambiBt._constants import CLASSIC_AUTH_LEVEL_MANAGER, CLASSIC_AUTH_LEVEL_VISITOR
+
 from ._cache import Cache
 
 
@@ -51,7 +53,7 @@ class KeyStore:
             raise ValueError("id")
 
         if any(filter(lambda k: k.id == id, self._keys)):  # type: ignore
-            self._logger.info(f"Key with id {id} already exists. Skipping...")
+            self._logger.debug(f"Key with id {id} already exists. Skipping...")
             return
 
         if "type" not in dict:
@@ -82,6 +84,24 @@ class KeyStore:
         self._logger.info(f"Added key {name} with role {role} to store.")
         await self._save()
 
+    async def setLegacyKey(self, key: str, isVisitor: bool) -> None:
+        keyRole = (
+            CLASSIC_AUTH_LEVEL_VISITOR if isVisitor else CLASSIC_AUTH_LEVEL_MANAGER
+        )
+        keyBytes = binascii.a2b_hex(key)
+        for i, k in enumerate(self._keys):
+            if k.type != -1:  # Not a legacy key
+                continue
+            if k.role == keyRole:
+                if k.key == keyBytes:
+                    return
+                _ = self._keys.pop(i)
+                break
+
+        self._keys.append(Key(-1, -1, keyRole, "legacy", keyBytes))
+        self._logger.info(f"Added legacy key with role {keyRole} to store.")
+        await self._save()
+
     async def clear(self, save: bool = False) -> None:
         self._keys.clear()
         self._logger.info("Keystore cleared.")
@@ -91,8 +111,18 @@ class KeyStore:
     def getKey(self) -> Key | None:
         key: Key | None = None
         for k in self._keys:
+            if k.type == -1:  # Legacy key
+                continue
             if not key:
                 key = k
             elif key.role < k.role:
                 key = k
         return key
+
+    def getLegacyKey(self, role: int) -> Key | None:
+        for k in self._keys:
+            if k.type != -1:  # Not a legacy key
+                continue
+            elif k.role == role:
+                return k
+        return None

@@ -2,6 +2,7 @@ import asyncio
 import logging
 from binascii import b2a_hex as b2a
 from collections.abc import Callable
+from copy import copy
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
@@ -9,14 +10,26 @@ from typing import Any, cast
 from bleak.backends.device import BLEDevice
 from httpx import AsyncClient, RequestError
 
+from CasambiBt._constants import IncomingPacketType
 from CasambiBt._switch import SwitchEvent
 
 from ._cache import Cache
-from ._client import CasambiClient, ConnectionState, IncomingPacketType
+from ._client import (
+    CasambiClient,
+    CasambiClientClassic,
+    CasambiClientEvolution,
+    ConnectionState,
+)
+from ._constants import isClassicNetwork
 from ._network import Network
-from ._operation import OpCode, OperationsContext
-from ._unit import Group, Scene, Unit, UnitControlType, UnitState
-from .errors import ConnectionStateError, ProtocolError
+from ._operation import (
+    OpCode,
+    OperationsContext,
+    OperationsContextClassic,
+    OperationsContextEvolution,
+)
+from ._unit import Group, Scene, Unit, UnitControl, UnitControlType, UnitState
+from .errors import ConnectionStateError
 
 
 class Casambi:
@@ -37,9 +50,10 @@ class Casambi:
         self._unitChangedCallbacks: list[Callable[[Unit], None]] = []
         self._switchEventCallbacks: list[Callable[[SwitchEvent], None]] = []
         self._disconnectCallbacks: list[Callable[[], None]] = []
+        self._connectionLock = asyncio.Lock()
 
         self._logger = logging.getLogger(__name__)
-        self._opContext = OperationsContext()
+        self._opContext: OperationsContext
         self._ownHttpClient = httpClient is None
         self._httpClient = httpClient
 
@@ -60,6 +74,7 @@ class Casambi:
 
     @property
     def networkId(self) -> str:
+        self._checkNetwork()
         return self._casaNetwork._id  # type: ignore
 
     @property
@@ -116,6 +131,7 @@ class Casambi:
         :raises NetworkNotFoundError: No network was found under the supplied address.
         :raises NetworkOnlineUpdateNeededError: An offline update isn't possible in the current state.
         :raises BluetoothError: An error occurred in the bluetooth stack.
+        :raises BluetoothDeviceNotFoundError: The bluetooth device belonging to the network can't be found.
         """
 
         if isinstance(addr_or_device, BLEDevice):
@@ -147,25 +163,58 @@ class Casambi:
             forceOffline = True
 
         await self._casaNetwork.update(forceOffline)
+        await self._connectClient(addr_or_device)
 
-        self._casaClient = CasambiClient(
-            addr_or_device,
-            self._dataCallback,
-            self._disconnectCallback,
-            self._casaNetwork,
-        )
-        await self._connectClient()
+    async def reconnect(self, addr_or_device: str | BLEDevice) -> None:
+        """Reestablish the bluetooth connection. Only works after initial connection attempt and before disconnect has been called.
 
-    async def _connectClient(self) -> None:
+        :param addr: The MAC address of the network or a BLEDevice. Use `discover` to find the address of a network.
+        :param password: The password for the network.
+        :raises ProtocolError: The network did not follow the expected protocol.
+        :raises BluetoothError: An error occurred in the bluetooth stack.
+        :raises BluetoothDeviceNotFoundError: The bluetooth device belonging to the network can't be found.
+        """
+
+        self._checkNetwork()
+        async with self._connectionLock:
+            if self._casaClient is None:
+                raise ConnectionStateError(
+                    ConnectionState.CONNECTED,
+                    ConnectionState.NONE,
+                    "Reconnect only possible after initial connection and before disconnect.",
+                )
+            if self.connected:
+                return
+            await self._casaClient.disconnect()
+            await self._connectClient(addr_or_device)
+
+    async def _connectClient(self, addr_or_device: str | BLEDevice) -> None:
         """Initiate the bluetooth connection."""
-        self._casaClient = cast(CasambiClient, self._casaClient)
-        await self._casaClient.connect()
+        self._casaNetwork = cast(Network, self._casaNetwork)
+
+        if isClassicNetwork(self._casaNetwork.protocolVersion):
+            self._casaClient = CasambiClientClassic(
+                addr_or_device,
+                self._dataCallback,
+                self._disconnectCallback,
+                self._casaNetwork,
+            )
+            self._opContext = OperationsContextClassic()
+        else:
+            self._casaClient = CasambiClientEvolution(
+                addr_or_device,
+                self._dataCallback,
+                self._disconnectCallback,
+                self._casaNetwork,
+            )
+            self._opContext = OperationsContextEvolution()
         try:
+            await self._casaClient.connect()
             await self._casaClient.exchangeKey()
             await self._casaClient.authenticate()
-        except ProtocolError as e:
+        except:
             await self._casaClient.disconnect()
-            raise e
+            raise
 
     async def setUnitState(self, target: Unit, state: UnitState) -> None:
         """Set the state of one unit directly.
@@ -173,9 +222,89 @@ class Casambi:
         :param target: The targeted unit.
         :param state: The desired state.
         :return: Nothing is returned by this function. To get the new state register a change handler.
+        :raises BluetoothError: An error occurred in the bluetooth stack.
         """
-        stateBytes = target.getStateAsBytes(state)
-        await self._send(target, stateBytes, OpCode.SetState)
+        if isClassicNetwork(self._casaNetwork.protocolVersion):  # type: ignore
+            for c in target.unitType.controls:
+                if c.type == UnitControlType.DIMMER and state.dimmer is not None:
+                    await self.setLevel(target, state.dimmer)
+                elif (
+                    c.type == UnitControlType.TEMPERATURE
+                    and state.temperature is not None
+                ):
+                    await self.setTemperature(target, state.temperature)
+                elif c.type == UnitControlType.VERTICAL and state.vertical is not None:
+                    await self.setVertical(target, state.vertical)
+                elif c.type == UnitControlType.WHITE and state.white is not None:
+                    await self.setWhite(target, state.white)
+                elif c.type == UnitControlType.RGB and state.rgb is not None:
+                    await self.setColor(target, state.rgb)
+        else:
+            stateBytes = target.getStateAsBytes(state)
+            await self._send(target, stateBytes, OpCode.SetState)
+
+    async def setControlValue(
+        self, unit: Unit, control: UnitControl, value: int
+    ) -> None:
+        """Set a single control's value and send the updated state.
+
+        The state is built from the unit's current raw state bytes with only
+        the bits described by ``control`` overwritten.  All other controls —
+        including UNKNOWN ones — remain unchanged.
+
+        :param unit: The target unit.
+        :param control: A :class:`UnitControl` from ``unit.unitType.controls``.
+        :param value: Raw integer value to write into the control's bit field.
+        :raises BluetoothError: An error occurred in the bluetooth stack.
+        """
+        if unit.state is not None and unit.state.raw_state is not None:
+            raw = bytearray(unit.state.raw_state)
+        else:
+            raw = bytearray(unit.unitType.stateLength)
+
+        # Clear the target bits then write the new value (little-endian bytes).
+        byte_start = control.offset // 8
+        bit_start = control.offset % 8
+        n_bytes = (control.length + bit_start + 7) // 8
+
+        current = int.from_bytes(
+            raw[byte_start : byte_start + n_bytes], byteorder="little"
+        )
+        mask = ((1 << control.length) - 1) << bit_start
+        current = (current & ~mask) | (
+            (value & ((1 << control.length) - 1)) << bit_start
+        )
+        raw[byte_start : byte_start + n_bytes] = current.to_bytes(
+            n_bytes, byteorder="little"
+        )
+
+        state_bytes = bytes(raw)
+        await self._send(unit, state_bytes, OpCode.SetState)
+        unit.setStateFromBytes(state_bytes)
+
+    async def setWhiteColorBalance(self, unit: Unit, value: int) -> None:
+        """Set the white/color balance for a unit with a WHITECOLORBALANCE control.
+
+        ``value`` is the raw 6-bit cross-fade level in the range [0, 63].
+        0 = pure white channel, 63 = pure color channel.
+
+        The balance is written via :meth:`setControlValue` which manipulates the
+        raw state bytes in-place and sends a ``SetState`` opcode, so all other
+        controls (brightness, colour, temperature) are preserved.
+
+        :param unit: The target unit.  Must have a ``WHITECOLORBALANCE`` control.
+        :param value: Raw balance level in range [0, 63].
+        :raises ValueError: The unit does not support ``WHITECOLORBALANCE``, or value out of range.
+        :raises BluetoothError: An error occurred in the bluetooth stack.
+        """
+        if value < 0 or value > 63:
+            raise ValueError(
+                f"White/color balance value {value} is not in range [0, 63]."
+            )
+        control = unit.unitType.get_control(UnitControlType.WHITECOLORBALANCE)
+        if control is None:
+            raise ValueError("The unit does not support WHITECOLORBALANCE.")
+        await self.setControlValue(unit, control, value)
 
     async def setLevel(self, target: Unit | Group | None, level: int) -> None:
         """Set the level (brightness) for one or multiple units.
@@ -188,6 +317,7 @@ class Casambi:
         :param level: The desired level in range [0, 255]. If 0 the unit is turned off.
         :return: Nothing is returned by this function. To get the new state register a change handler.
         :raises ValueError: The supplied level isn't in range
+        :raises BluetoothError: An error occurred in the bluetooth stack.
         """
         if level < 0 or level > 255:
             raise ValueError()
@@ -206,6 +336,7 @@ class Casambi:
         :param vertical: The desired vertical balance in range [0, 255]. If 0 the unit is turned off.
         :return: Nothing is returned by this function. To get the new state register a change handler.
         :raises ValueError: The supplied level isn't in range
+        :raises BluetoothError: An error occurred in the bluetooth stack.
         """
         if vertical < 0 or vertical > 255:
             raise ValueError()
@@ -224,6 +355,7 @@ class Casambi:
         :param value: The desired value in range [0, 255].
         :return: Nothing is returned by this function. To get the new state register a change handler.
         :raises ValueError: The supplied level isn't in range
+        :raises BluetoothError: An error occurred in the bluetooth stack.
         """
         if value < 0 or value > 255:
             raise ValueError()
@@ -242,6 +374,7 @@ class Casambi:
         :param level: The desired level in range [0, 255].
         :return: Nothing is returned by this function. To get the new state register a change handler.
         :raises ValueError: The supplied level isn't in range
+        :raises BluetoothError: An error occurred in the bluetooth stack.
         """
         if level < 0 or level > 255:
             raise ValueError()
@@ -262,17 +395,16 @@ class Casambi:
         :param rgbColor: The desired color as a tuple of three ints in range [0, 255].
         :return: Nothing is returned by this function. To get the new state register a change handler.
         :raises ValueError: The supplied rgbColor isn't in range
+        :raises BluetoothError: An error occurred in the bluetooth stack.
         """
 
-        state = UnitState()
-        state.rgb = rgbColor
-        hs: tuple[float, float] = state.hs  # type: ignore[assignment]
-        hue = round(hs[0] * 1023)
-        sat = round(hs[1] * 255)
-
-        payload = hue.to_bytes(2, byteorder="little", signed=False) + sat.to_bytes(
-            1, byteorder="little", signed=False
-        )
+        if isClassicNetwork(self._casaNetwork.protocolVersion):  # type: ignore
+            payload = UnitState.payload_from_rgb(rgbColor)
+        else:
+            state = UnitState()
+            state.rgb = rgbColor
+            hs: tuple[float, float] = state.hs  # type: ignore[assignment]
+            payload = UnitState.payload_from_hs(hs)
         await self._send(target, payload, OpCode.SetColor)
 
     async def setTemperature(
@@ -288,10 +420,10 @@ class Casambi:
         :param temperature: The desired temperature in degrees Kelvin.
         :return: Nothing is returned by this function. To get the new state register a change handler.
         :raises ValueError: The supplied temperature isn't in range
+        :raises BluetoothError: An error occurred in the bluetooth stack.
         """
 
-        temperature = int(temperature / 50)
-        payload = temperature.to_bytes(1, byteorder="big", signed=False)
+        payload = UnitState.payload_from_temperature(temperature)
         await self._send(target, payload, OpCode.SetTemperature)
 
     async def setColorXY(
@@ -307,23 +439,21 @@ class Casambi:
         :param xyColor: The desired color as a pair of floats in the range [0.0, 1.0].
         :return: Nothing is returned by this function. To get the new state register a change handler.
         :raises ValueError: The supplied XYColor isn't in range or not supported by the supplied unit.
+        :raises BluetoothError: An error occurred in the bluetooth stack.
         """
 
         if xyColor[0] < 0.0 or xyColor[0] > 1.0 or xyColor[1] < 0.0 or xyColor[1] > 1.0:
             raise ValueError("Color out of range.")
 
         # We assume a default length of 22 bits, so 11 bits per coordinate. Is this sane?
-        coordLen = 11
+        length = 22
         if target is not None and isinstance(target, Unit):
             control = target.unitType.get_control(UnitControlType.XY)
             if control is None:
                 raise ValueError("The control isn't supported by this unit.")
-            coordLen = control.length // 2
-        mask = (1 << coordLen) - 1
-        x = round(xyColor[0] * mask) & mask
-        y = round(xyColor[1] * mask) & mask
+            length = control.length
 
-        payload = ((x << coordLen) | y).to_bytes(3, byteorder="little", signed=False)
+        payload = UnitState.payload_from_xy(xyColor, length)
         await self._send(target, payload, OpCode.SetColorXY)
 
     async def turnOn(self, target: Unit | Group | None) -> None:
@@ -335,12 +465,42 @@ class Casambi:
 
         :param target: One or multiple targeted units.
         :return: Nothing is returned by this function. To get the new state register a change handler.
+        :raises BluetoothError: An error occurred in the bluetooth stack.
         """
+        self._checkNetwork()
 
-        # Use -1 to indicate special packet format
-        # Use RestoreLastLevel flag (1) and UseFullTimeFlag (4).
-        # Not sure what UseFullTime does but this is what the app uses.
-        await self._send(target, b"\xff\x05", OpCode.SetLevel)
+        if isClassicNetwork(self._casaNetwork.protocolVersion):  # type: ignore
+            await self._send(target, b"\xff\x01\x00\x00\x01", OpCode.SetLevel)
+        else:
+            # Use -1 to indicate special packet format
+            # Use RestoreLastLevel flag (1) and UseFullTimeFlag (4).
+            # Not sure what UseFullTime does but this is what the app uses.
+            await self._send(target, b"\xff\x05", OpCode.SetLevel)
+
+    async def turnOff(self, target: Unit | Group | None) -> None:
+        """Turn one or multiple units off.
+
+        If ``target`` is of type ``Unit`` only this unit is affected.
+        If ``target`` is of type ``Group`` the whole group is affected.
+        if ``target`` is of type ``None`` all units in the network are affected.
+
+        :param target: One or multiple targeted units.
+        :return: Nothing is returned by this function. To get the new state register a change handler.
+        :raises BluetoothError: An error occurred in the bluetooth stack.
+        """
+        self._checkNetwork()
+
+        if (
+            isinstance(target, Unit)
+            and target.unitType.get_control(UnitControlType.ONOFF) is not None
+            and not isClassicNetwork(self._casaNetwork.protocolVersion)  # type: ignore
+        ):
+            state = copy(target.state) if target.state is not None else UnitState()
+            state.onoff = False
+            stateBytes = target.getStateAsBytes(state)
+            await self._send(target, stateBytes, OpCode.SetState)
+        else:
+            await self.setLevel(target, 0)
 
     async def switchToScene(self, target: Scene, level: int = 0xFF) -> None:
         """Switch the network to a predefined scene.
@@ -348,6 +508,7 @@ class Casambi:
         :param target: The scene to switch to.
         :param level: An optional relative brightness for all units in the scene.
         :return: Nothing is returned by this function. To get the new state register a change handler.
+        :raises BluetoothError: An error occurred in the bluetooth stack.
         """
         await self.setLevel(target, level)  # type: ignore[arg-type]
 
@@ -360,31 +521,18 @@ class Casambi:
                 ConnectionState.NONE,
             )
 
-        targetCode = 0
-        if isinstance(target, Unit):
-            assert target.deviceId <= 0xFF
-            targetCode = (target.deviceId << 8) | 0x01
-        elif isinstance(target, Group):
-            assert target.groudId <= 0xFF
-            targetCode = (target.groudId << 8) | 0x02
-        elif isinstance(target, Scene):
-            assert target.sceneId <= 0xFF
-            targetCode = (target.sceneId << 8) | 0x04
-        elif target is not None:
-            raise TypeError(f"Unkown target type {type(target)}")
-
         self._logger.debug(
-            f"Sending operation {opcode.name} with payload {b2a(state)} for {targetCode:x}"
+            f"Sending operation {opcode.name} with payload {b2a(state)}."
         )
 
-        opPkt = self._opContext.prepareOperation(opcode, targetCode, state)
+        opPkt = self._opContext.prepareOperation(opcode, target, state)
 
         try:
             await self._casaClient.send(opPkt)
         except ConnectionStateError as exc:
             if exc.got == ConnectionState.NONE:
                 self._logger.info("Trying to reconnect broken connection once.")
-                await self._connectClient()
+                await self.reconnect(self._casaClient._address_or_devive)
                 await self._casaClient.send(opPkt)
             else:
                 raise exc
@@ -392,7 +540,7 @@ class Casambi:
     def _dataCallback(
         self, packetType: IncomingPacketType, data: dict[str, Any] | SwitchEvent
     ) -> None:
-        self._logger.info(f"Incomming data callback of type {packetType}")
+        self._logger.debug(f"Incoming data callback of type {str(packetType)}")
         if packetType == IncomingPacketType.UnitState:
             unitData = cast(dict[str, Any], data)
             self._logger.debug(
@@ -467,13 +615,13 @@ class Casambi:
         """Register a new handler for switch events.
 
         This handler is called whenever a switch event is received.
-        The handler is supplied with a dictionary containing:
+        The handler is supplied with a SwitchEvent containing:
         - unit_id: The ID of the switch unit
-        - button: The button number that was pressed/released
-        - event: Either "button_press" or "button_release"
-        - message_type: The raw message type (0x08 or 0x10)
-        - flags: Additional flags from the message
-        - extra_data: Any additional data from the message
+        - button: The button number (1-based, = button_event_index + 1)
+        - button_event_index: 0-based index from the protocol
+        - event: A ButtonEventType (PRESS, RELEASE, HOLD, RELEASE_AFTER_HOLD)
+        - flags: Frame flags
+        - extra_data: Any additional payload bytes
 
         :param handler: The method to call when a switch event is received.
         """

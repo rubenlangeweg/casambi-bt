@@ -2,14 +2,14 @@ import json
 import logging
 import pickle
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Final, cast
 
 import httpx
 from httpx import AsyncClient, RequestError
 
 from ._cache import Cache
-from ._constants import DEVICE_NAME
+from ._constants import DEVICE_NAME, isClassicNetwork
 from ._keystore import KeyStore
 from ._unit import Group, Scene, Unit, UnitControl, UnitControlType, UnitType
 from .errors import (
@@ -34,7 +34,7 @@ class _NetworkSession:
     role: int = 3  # TODO: Support other role types?
 
     def expired(self) -> bool:
-        return datetime.utcnow() > self.expires
+        return datetime.now(UTC) > self.expires
 
 
 class Network:
@@ -169,8 +169,8 @@ class Network:
         if res.status_code == httpx.codes.OK:
             # Parse session
             sessionJson = res.json()
-            sessionJson["expires"] = datetime.utcfromtimestamp(
-                sessionJson["expires"] / 1000
+            sessionJson["expires"] = datetime.fromtimestamp(
+                sessionJson["expires"] / 1000, UTC
             )
             self._session = _NetworkSession(**sessionJson)
             self._logger.info("Login sucessful.")
@@ -257,7 +257,11 @@ class Network:
             for k in keys:
                 await self._keystore.addKey(k)
 
-        # TODO: Parse managerKey and visitorKey for classic networks.
+        # Parse legacy keys
+        if "visitorKey" in network["network"]:
+            await self._keystore.setLegacyKey(network["network"]["visitorKey"], True)
+        if "managerKey" in network["network"]:
+            await self._keystore.setLegacyKey(network["network"]["managerKey"], False)
 
         # Parse units
         self.units = []
@@ -277,6 +281,7 @@ class Network:
                 u["name"],
                 str(u["firmware"]),
                 uType,
+                _isClassic=isClassicNetwork(self._protocolVersion),
             )
             self.units.append(uObj)
 
@@ -330,7 +335,7 @@ class Network:
             cachedType, cacheExpiry = self._unitTypes[id]
 
             # We don't want to cache types forever so use an expiry date.
-            if cacheExpiry < datetime.utcnow():
+            if cacheExpiry < datetime.now(UTC):
                 self._logger.info("Cache expiry for type %i. Refetching.", id)
                 self._unitTypes.pop(id)
             else:
@@ -344,7 +349,7 @@ class Network:
             self._logger.error(f"Getting unit info returned {res.status_code}")
             self._unitTypes[id] = (
                 None,
-                datetime.utcnow() + timedelta(days=7),
+                datetime.now(UTC) + timedelta(days=7),
             )
             return None
 
@@ -360,7 +365,7 @@ class Network:
                 self._logger.warning(
                     f"Unsupported control mode {typeStr} in fixture {id}."
                 )
-                type = UnitControlType.UNKOWN
+                type = UnitControlType.UNIMPLEMENTED
 
             controlObj = UnitControl(
                 type,
@@ -387,7 +392,7 @@ class Network:
         # Chache unit type
         self._unitTypes[unitTypeObj.id] = (
             unitTypeObj,
-            datetime.utcnow() + timedelta(days=28),
+            datetime.now(UTC) + timedelta(days=28),
         )
 
         self._logger.info("Sucessfully fetched unit type.")
